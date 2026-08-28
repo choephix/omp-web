@@ -221,6 +221,34 @@ function getRecentProjects(sessions: SessionInfo[]): string[] {
     .map(([root]) => root);
 }
 
+/**
+ * Split the session list into the sessions shown in the project groups and the
+ * archived ones (newest first) shown in the Archived section. Archiving is a
+ * web-only, reversible sidebar move: the transcript, its file and any running
+ * agent are untouched, so archived sessions stay in the payload.
+ */
+function partitionArchivedSessions(sessions: SessionInfo[]): { active: SessionInfo[]; archived: SessionInfo[] } {
+  const active: SessionInfo[] = [];
+  const archived: SessionInfo[] = [];
+  for (const session of sessions) {
+    if (session.archived === true) archived.push(session);
+    else active.push(session);
+  }
+  archived.sort((a, b) => b.modified.localeCompare(a.modified));
+  return { active, archived };
+}
+
+/** Flip a session's archived flag. Resolves false when the server refused. */
+async function patchSessionArchived(sessionId: string, archived: boolean): Promise<boolean> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived }),
+  });
+  return res.ok;
+}
+
+
 /** Substitute the home dir prefix with ~ (no path truncation — see PathLabel) */
 function displayCwd(cwd: string, homeDir?: string): string {
   return (homeDir && cwd.startsWith(homeDir)) ? "~" + cwd.slice(homeDir.length) : cwd;
@@ -457,6 +485,9 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
   const [projectFilter, setProjectFilter] = useState("");
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
+  // Archived sessions are opt-in: the section starts collapsed so it stays out
+  // of the way of the project groups.
+  const [archivedCollapsed, setArchivedCollapsed] = useState(true);
   const [hoveredProject, setHoveredProject] = useState<string | null>(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState<string | null>(null);
   const [removedProjects, setRemovedProjects] = useState<Set<string>>(() => new Set());
@@ -737,7 +768,8 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
         // Session not found — notify parent so it can show the placeholder
         onInitialRestoreDone?.();
       }
-      const projects = getRecentProjects(allSessions)
+      // Archived sessions must not resurrect a project the user tidied away.
+      const projects = getRecentProjects(allSessions.filter((session) => session.archived !== true))
         .filter((project) => !removedProjects.has(normalizeProjectKey(project)));
       if (projects.length > 0) setSelectedCwd(projects[0]);
     }
@@ -876,6 +908,16 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
     onSelectSession(s);
   }, [onSelectSession]);
 
+  // Move the row between the project groups and the Archived section right
+  // away, then reconcile with the server. Never touches the open session or a
+  // running agent — archiving is a listing change only.
+  const handleArchivedChange = useCallback((sessionId: string, archived: boolean) => {
+    setAllSessions((current) => current.map((session) => (
+      session.id === sessionId ? { ...session, archived } : session
+    )));
+    loadSessions();
+  }, [loadSessions]);
+
   const handleNewSession = useCallback((project = selectedCwd) => {
     if (!project) return;
     // Generate a temporary UUID client-side — no backend call needed.
@@ -897,8 +939,13 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
     });
   }, []);
 
+  const { active: activeSessions, archived: archivedSessions } = useMemo(
+    () => partitionArchivedSessions(sessionsForDisplay),
+    [sessionsForDisplay],
+  );
+
   const selectedProject = projectRootFor(selectedCwd);
-  const projectPaths = getRecentProjects(sessionsForDisplay)
+  const projectPaths = getRecentProjects(activeSessions)
     .filter((project) => !removedProjects.has(normalizeProjectKey(project)));
   if (selectedProject && !removedProjects.has(normalizeProjectKey(selectedProject)) && !projectPaths.includes(selectedProject)) {
     projectPaths.unshift(selectedProject);
@@ -925,7 +972,7 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
   };
 
   const sessionsByProject = new Map<string, SessionInfo[]>();
-  for (const session of sessionsForDisplay) {
+  for (const session of activeSessions) {
     const project = session.projectRoot ?? session.cwd;
     if (!project) continue;
     const projectSessions = sessionsByProject.get(project);
@@ -938,7 +985,7 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
   // cheap to recompute.
   const projectActivity = useMemo(() => {
     const counts = new Map<string, { running: number; unread: number }>();
-    for (const session of sessionsForDisplay) {
+    for (const session of activeSessions) {
       const key = session.projectRoot ?? session.cwd;
       if (!key) continue;
       let entry = counts.get(key);
@@ -947,7 +994,7 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
       if (unreadSessionIds.has(session.id)) entry.unread++;
     }
     return counts;
-  }, [sessionsForDisplay, runningSessionIds, unreadSessionIds]);
+  }, [activeSessions, runningSessionIds, unreadSessionIds]);
 
   const normalizedProjectFilter = projectFilter.trim().toLowerCase();
   const projectGroups = projectPaths.flatMap((project) => {
@@ -963,6 +1010,18 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
     });
     if (!projectMatches && matchingSessions.length === 0) return [];
     return [{ project, name, sessions: projectMatches ? sessions : matchingSessions }];
+  });
+
+  // Archived rows carry their project label because they are listed outside the
+  // project groups; the search box filters them on title or project.
+  const archivedRows = archivedSessions.flatMap((session) => {
+    const project = session.projectRoot ?? session.cwd;
+    const projectLabel = project ? project.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || project : "";
+    if (!normalizedProjectFilter) return [{ session, project, projectLabel }];
+    const title = session.name || session.firstMessage.slice(0, 50) || session.id.slice(0, 12);
+    return title.toLowerCase().includes(normalizedProjectFilter) || projectLabel.toLowerCase().includes(normalizedProjectFilter)
+      ? [{ session, project, projectLabel }]
+      : [];
   });
 
   const showWorktreeSwitcher = Boolean(
@@ -1716,6 +1775,7 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
                       unreadSessionIds={unreadSessionIds}
                       onSelectSession={handleSelectSessionFromList}
                       onRenamed={loadSessions}
+                      onArchivedChange={handleArchivedChange}
                       onSessionDeleted={(id) => {
                         onSessionDeleted?.(id);
                         loadSessions();
@@ -1754,6 +1814,69 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
             </section>
           );
         })}
+
+        {!loading && !error && archivedRows.length > 0 && (
+          <section style={{ marginTop: 4, borderTop: "1px solid var(--border)", paddingTop: 2 }}>
+            <button
+              type="button"
+              onClick={() => setArchivedCollapsed((collapsed) => !collapsed)}
+              title={archivedCollapsed ? t("sidebar.expandArchived") : t("sidebar.collapseArchived")}
+              aria-label={archivedCollapsed ? t("sidebar.expandArchived") : t("sidebar.collapseArchived")}
+              aria-expanded={!archivedCollapsed}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                width: "100%",
+                height: 28,
+                padding: "0 6px",
+                border: "none",
+                background: "transparent",
+                color: "var(--text-dim)",
+                cursor: "pointer",
+                textAlign: "left",
+                fontSize: 11,
+                fontWeight: 600,
+                letterSpacing: "0.05em",
+                textTransform: "uppercase",
+              }}
+            >
+              <svg
+                width="9" height="9" viewBox="0 0 10 10" fill="none"
+                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+                aria-hidden="true"
+                style={{ transform: archivedCollapsed ? "none" : "rotate(90deg)", transition: "transform 0.15s", flexShrink: 0 }}
+              >
+                <polyline points="3 2 7 5 3 8" />
+              </svg>
+              <span>{t("sidebar.archived")}</span>
+              <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, letterSpacing: 0 }}>{archivedRows.length}</span>
+            </button>
+            {!archivedCollapsed && (
+              <div style={{ paddingLeft: 12 }}>
+                {archivedRows.map(({ session, project, projectLabel }) => (
+                  <SessionItem
+                    key={session.id}
+                    session={session}
+                    isSelected={session.id === selectedSessionId}
+                    isRunning={runningSessionIds.has(session.id)}
+                    isUnread={unreadSessionIds.has(session.id)}
+                    isArchived
+                    projectLabel={projectLabel}
+                    projectPath={project}
+                    onClick={() => handleSelectSessionFromList(session)}
+                    onRenamed={loadSessions}
+                    onArchivedChange={handleArchivedChange}
+                    onDeleted={(id) => {
+                      onSessionDeleted?.(id);
+                      loadSessions();
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        )}
       </div>
 
       {/* File Explorer section */}
@@ -1884,6 +2007,7 @@ function SessionTreeItem({
   unreadSessionIds,
   onSelectSession,
   onRenamed,
+  onArchivedChange,
   onSessionDeleted,
   depth,
 }: {
@@ -1893,6 +2017,7 @@ function SessionTreeItem({
   unreadSessionIds: Set<string>;
   onSelectSession: (s: SessionInfo) => void;
   onRenamed?: () => void;
+  onArchivedChange?: (id: string, archived: boolean) => void;
   onSessionDeleted?: (id: string) => void;
   depth: number;
 }) {
@@ -1920,6 +2045,7 @@ function SessionTreeItem({
           isUnread={unreadSessionIds.has(node.session.id)}
           onClick={() => onSelectSession(node.session)}
           onRenamed={onRenamed}
+          onArchivedChange={onArchivedChange}
           onDeleted={(id) => onSessionDeleted?.(id)}
           depth={depth}
           hasChildren={hasChildren}
@@ -1938,6 +2064,7 @@ function SessionTreeItem({
               unreadSessionIds={unreadSessionIds}
               onSelectSession={onSelectSession}
               onRenamed={onRenamed}
+              onArchivedChange={onArchivedChange}
               onSessionDeleted={onSessionDeleted}
               depth={depth + 1}
             />
@@ -2062,11 +2189,15 @@ function SessionItem({
   isUnread,
   onClick,
   onRenamed,
+  onArchivedChange,
   onDeleted,
   depth = 0,
   hasChildren = false,
   collapsed = false,
   onToggleCollapse,
+  isArchived = false,
+  projectLabel,
+  projectPath,
 }: {
   session: SessionInfo;
   isSelected: boolean;
@@ -2074,11 +2205,17 @@ function SessionItem({
   isUnread?: boolean;
   onClick: () => void;
   onRenamed?: () => void;
+  onArchivedChange?: (id: string, archived: boolean) => void;
   onDeleted?: (id: string) => void;
   depth?: number;
   hasChildren?: boolean;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  /** Row lives in the Archived section: offers restore instead of archive. */
+  isArchived?: boolean;
+  /** Project label shown on archived rows, which sit outside project groups. */
+  projectLabel?: string;
+  projectPath?: string;
 }) {
   const { t } = useI18n();
   const [hovered, setHovered] = useState(false);
@@ -2086,6 +2223,7 @@ function SessionItem({
   const [renameValue, setRenameValue] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Select the whole name once the rename input is mounted (startRename's
@@ -2143,6 +2281,19 @@ function SessionItem({
     }
   }, [session.id, session.transient, onDeleted]);
 
+  // Archiving is reversible and needs no confirmation: nothing is deleted, the
+  // session keeps running, and the row only moves to the Archived section.
+  const handleArchiveClick = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (session.transient || archiveBusy) return;
+    const next = !isArchived;
+    setArchiveBusy(true);
+    void patchSessionArchived(session.id, next)
+      .then((ok) => { if (ok) onArchivedChange?.(session.id, next); })
+      .catch(() => { /* Leave the row in place; the next refresh reconciles. */ })
+      .finally(() => setArchiveBusy(false));
+  }, [archiveBusy, isArchived, onArchivedChange, session.id, session.transient]);
+
   const handleDeleteClick = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
     if (e.shiftKey) {
@@ -2178,7 +2329,9 @@ function SessionItem({
   }, [onRenamed, session.cwd, session.id, session.name, session.path]);
 
   // Fixed height keeps hover and confirmation states from reflowing the list.
-  const ITEM_HEIGHT = 40;
+  // Compact: the tallest inline control (rename input / confirm buttons) is
+  // sized to fit within it, so no state clips.
+  const ITEM_HEIGHT = 28;
 
   return (
     <div
@@ -2200,7 +2353,7 @@ function SessionItem({
           ? "2px solid #ef4444"
           : isSelected ? "2px solid var(--accent)" : "2px solid transparent",
         transition: "background 0.1s",
-        opacity: deleting ? 0.5 : 1,
+        opacity: deleting || archiveBusy ? 0.5 : 1,
         gap: 4,
         overflow: "hidden",
       }}
@@ -2216,14 +2369,14 @@ function SessionItem({
               onClick={handleDeleteConfirm}
               style={{
                 display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
-                height: 30, padding: "0 11px",
+                height: 22, padding: "0 8px",
                 background: "#ef4444", border: "none",
                 borderRadius: 6, color: "#fff",
-                cursor: "pointer", fontSize: 12, fontWeight: 600,
+                cursor: "pointer", fontSize: 11.5, fontWeight: 600,
                 whiteSpace: "nowrap",
               }}
             >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <polyline points="3 6 5 6 21 6" />
                 <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
                 <path d="M10 11v6M14 11v6" />
@@ -2235,10 +2388,10 @@ function SessionItem({
               onClick={handleDeleteCancel}
               style={{
                 display: "flex", alignItems: "center", justifyContent: "center",
-                height: 30, padding: "0 11px",
+                height: 22, padding: "0 8px",
                 background: "var(--bg)", border: "1px solid var(--border)",
                 borderRadius: 6, color: "var(--text-muted)",
-                cursor: "pointer", fontSize: 12, fontWeight: 500,
+                cursor: "pointer", fontSize: 11.5, fontWeight: 500,
                 whiteSpace: "nowrap",
               }}
             >
@@ -2261,13 +2414,13 @@ function SessionItem({
           style={{
             flex: 1,
             fontSize: 12,
-            padding: "5px 8px",
+            padding: "1px 6px",
             border: "1px solid var(--accent)",
             borderRadius: 5,
             outline: "none",
             background: "var(--bg)",
             color: "var(--text)",
-            height: 30,
+            height: 22,
           }}
         />
       ) : (
@@ -2299,6 +2452,23 @@ function SessionItem({
             <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {title}
             </span>
+            {projectLabel && (
+              <span
+                title={projectPath ? t("sidebar.projectPath", { path: projectPath }) : undefined}
+                style={{
+                  flexShrink: 0,
+                  maxWidth: "45%",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  color: "var(--text-dim)",
+                  fontSize: 10.5,
+                  fontFamily: "var(--font-mono)",
+                }}
+              >
+                {projectLabel}
+              </span>
+            )}
             {isRunning && <RunningSessionIndicator />}
             {!isRunning && isUnread && <UnreadSessionIndicator />}
             {session.worktreeBranch && (
@@ -2341,7 +2511,7 @@ function SessionItem({
                 title={t("sidebar.rename")}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 26, height: 26, padding: 0,
+                  width: 22, height: 22, padding: 0,
                   background: "transparent", border: "none",
                   borderRadius: 5, color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
@@ -2363,11 +2533,49 @@ function SessionItem({
                 </svg>
               </button>
               <button
+                onClick={handleArchiveClick}
+                disabled={archiveBusy}
+                title={isArchived ? t("sidebar.restoreTitle") : t("sidebar.archiveTitle")}
+                aria-label={isArchived ? t("sidebar.restoreTitle") : t("sidebar.archiveTitle")}
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 22, height: 22, padding: 0,
+                  background: "transparent", border: "none",
+                  borderRadius: 5, color: "var(--text-muted)",
+                  cursor: archiveBusy ? "default" : "pointer", flexShrink: 0,
+                  transition: "background 0.12s, color 0.12s, border-color 0.12s",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = "var(--bg-selected)";
+                  e.currentTarget.style.color = "var(--accent)";
+                  e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                  e.currentTarget.style.color = "var(--text-muted)";
+                  e.currentTarget.style.borderColor = "transparent";
+                }}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <rect x="2" y="3" width="20" height="5" rx="1" />
+                  <path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8" />
+                  {isArchived ? (
+                    <>
+                      <path d="m9 15 3-3 3 3" />
+                      <path d="M12 12v6" />
+                    </>
+                  ) : (
+                    <path d="M10 12h4" />
+                  )}
+                </svg>
+              </button>
+              {isArchived && (
+              <button
                 onClick={handleDeleteClick}
                 title={t("sidebar.deleteWithShiftClick")}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 26, height: 26, padding: 0,
+                  width: 22, height: 22, padding: 0,
                   background: "transparent", border: "none",
                   borderRadius: 5, color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
@@ -2391,6 +2599,7 @@ function SessionItem({
                   <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
                 </svg>
               </button>
+              )}
             </div>
           )}
         </>

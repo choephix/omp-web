@@ -82,6 +82,36 @@ test("CodeBlock renders plain text without tokenization while streaming", () => 
   assert.match(html, /const x = 1;/);
 });
 
+const longCodeLine = `const value = "${"x".repeat(200)}";`;
+
+test("CodeBlock wraps long streaming lines instead of scrolling horizontally", () => {
+  const html = renderCode({ code: longCodeLine, lang: "javascript", isStreaming: true });
+
+  assert.match(html, /<pre style="[^"]*white-space:pre-wrap/);
+  assert.match(html, /<pre style="[^"]*overflow-x:hidden/);
+  assert.match(html, /<code style="[^"]*white-space:pre-wrap;overflow-wrap:anywhere/);
+  assert.doesNotMatch(html, /overflow-x:auto/);
+});
+
+test("CodeBlock wraps long highlighted lines beside the line-number gutter", () => {
+  const html = renderCode({ code: longCodeLine, lang: "javascript" });
+
+  assert.match(html, /class="markdown-code-line" style="display:flex"/);
+  assert.match(html, /class="markdown-code-line-content" style="[^"]*white-space:pre-wrap;overflow-wrap:anywhere/);
+  assert.match(html, /react-syntax-highlighter-line-number/);
+  assert.match(html, /class="token/);
+  assert.doesNotMatch(html, /overflow-x:auto/);
+});
+
+test("CodeBlock uses compact 9px typography in both streaming and settled states", () => {
+  for (const isStreaming of [true, false]) {
+    const html = renderCode({ code: longCodeLine, lang: "javascript", isStreaming });
+
+    assert.match(html, /font-size:9px/);
+    assert.match(html, /line-height:1\.45/);
+  }
+});
+
 test("MermaidBlock handles Chinese characters in diagram", () => {
   const chineseMermaid = `sequenceDiagram
     participant PC as PC客户端

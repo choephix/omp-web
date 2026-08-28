@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
+import { getAgentDir } from "@oh-my-pi/pi-coding-agent";
 import {
   attachSessionProjectInfo,
   listAllSessions,
   mergeSessionLists,
 } from "@/lib/session-reader";
+import { annotateArchivedSessions } from "@/lib/session-archive";
 import { getRpcSessionInfos, getRunningRpcSessionIds } from "@/lib/rpc-manager";
 
 export const dynamic = "force-dynamic";
@@ -15,7 +17,10 @@ export async function GET(req: Request) {
       listAllSessions({ force }),
       attachSessionProjectInfo(getRpcSessionInfos()),
     ]);
-    const sessions = mergeSessionLists(persistedSessions, runtimeSessions);
+    const sessions = annotateArchivedSessions(
+      mergeSessionLists(persistedSessions, runtimeSessions),
+      getAgentDir(),
+    );
     return NextResponse.json(
       { sessions, runningSessionIds: getRunningRpcSessionIds() },
       { headers: { "Cache-Control": "no-store" } },

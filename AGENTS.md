@@ -107,6 +107,7 @@ lib/
   omp-types.ts         structural view of omp's AgentSession
   project-trust.ts     gates a project's executable resources
   rpc-manager.ts       AgentSessionWrapper + registry + startRpcSession
+  session-archive.ts   web-only archive registry; never moves session JSONL files
   session-reader.ts    session listing + path cache + buildSessionContext adapter
   session-system-prompt.ts  SYSTEM.md / APPEND_SYSTEM.md resolution per session cwd
   session-title.ts     thin wrapper over omp's own title generator
@@ -188,6 +189,14 @@ An explicit model pick in the browser is persisted as `modelRoles.default`
 
 ### Session files can be fully rewritten
 `parentSession` in the header is **display metadata only** — has zero effect on chat content. Safe to `writeFileSync` the entire file (omp does this itself during migrations). Used when cascade-reparenting children on delete.
+
+### Session archiving is web-only view state
+`lib/session-archive.ts` stores archived session ids in
+`~/.omp/agent/omp-web-archived-sessions.json`. Archiving must never move,
+rewrite, delete, or stop the session: `GET /api/sessions` only annotates matching
+rows with `archived: true`, and the sidebar partitions them into its reversible
+Archived section. Permanent deletion remains a separate action available from
+that section and removes the registry entry after deleting the JSONL file.
 
 ### `SessionManager.open()` is async
 Every omp `SessionManager.open()` / `forkFrom()` / `continueRecent()` returns a

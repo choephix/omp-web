@@ -1,7 +1,11 @@
 "use client";
 
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  Prism as SyntaxHighlighter,
+  createElement as renderSyntaxNode,
+  type SyntaxHighlighterProps,
+} from "react-syntax-highlighter";
 import { vs } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { useTheme } from "@/hooks/useTheme";
@@ -220,6 +224,88 @@ function MermaidZoomDialog({ svg, onClose }: { svg: string; onClose: () => void 
   );
 }
 
+/** Shared typography for the streaming and highlighted code renderers. */
+const CODE_BLOCK_FONT_SIZE = 9;
+const CODE_BLOCK_LINE_HEIGHT = 1.45;
+
+/** Long lines wrap instead of scrolling the block horizontally. */
+const CODE_BLOCK_WRAP_STYLE: CSSProperties = {
+  whiteSpace: "pre-wrap",
+  overflowWrap: "anywhere",
+  overflowX: "hidden",
+};
+
+const CODE_BLOCK_SURFACE_STYLE: CSSProperties = {
+  margin: 0,
+  padding: "11px 13px",
+  fontSize: CODE_BLOCK_FONT_SIZE,
+  lineHeight: CODE_BLOCK_LINE_HEIGHT,
+  background: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
+};
+
+const CODE_BLOCK_CODE_TAG_STYLE: CSSProperties = {
+  fontFamily: "var(--font-mono)",
+  whiteSpace: "pre-wrap",
+  overflowWrap: "anywhere",
+};
+
+const CODE_BLOCK_LINE_NUMBER_STYLE: CSSProperties = {
+  color: "var(--text-dim)",
+  fontStyle: "normal",
+  fontVariantNumeric: "tabular-nums",
+  userSelect: "none",
+  flexShrink: 0,
+};
+
+type CodeLineRendererProps = Parameters<NonNullable<SyntaxHighlighterProps["renderer"]>>[0];
+
+/**
+ * Renders every highlighted line as a flex row — line number gutter plus a
+ * wrapping content cell — so a wrapped continuation stays clear of the gutter
+ * instead of flowing underneath it.
+ */
+function CodeLineRenderer({ rows, stylesheet, useInlineStyles }: CodeLineRendererProps) {
+  return rows.map((row, lineIndex) => {
+    const children = row.children ?? [];
+    const firstChildClasses = children[0]?.properties?.className;
+    const hasLineNumber = Array.isArray(firstChildClasses)
+      && firstChildClasses.includes("react-syntax-highlighter-line-number");
+    const lineNumberNode = hasLineNumber ? children[0] : null;
+    const contentNodes = hasLineNumber ? children.slice(1) : children;
+
+    return (
+      <span
+        className="markdown-code-line"
+        key={`code-line-${lineIndex}`}
+        style={{ display: "flex" }}
+      >
+        {lineNumberNode && renderSyntaxNode({
+          node: lineNumberNode,
+          stylesheet,
+          useInlineStyles,
+          key: `code-line-number-${lineIndex}`,
+        })}
+        <span
+          className="markdown-code-line-content"
+          style={{
+            flex: "1 1 auto",
+            minWidth: 0,
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {contentNodes.map((node, tokenIndex) => renderSyntaxNode({
+            node,
+            stylesheet,
+            useInlineStyles,
+            key: `code-token-${lineIndex}-${tokenIndex}`,
+          }))}
+        </span>
+      </span>
+    );
+  });
+}
+
 interface CodeBlockProps {
   code: string;
   lang: string;
@@ -264,33 +350,23 @@ export const CodeBlock = memo(function CodeBlock({ code, lang, headerAction, isS
         </div>
       </div>
       {isStreaming ? (
-        <pre
-          style={{
-            margin: 0,
-            padding: "11px 13px",
-            fontSize: 12.5,
-            lineHeight: 1.62,
-            overflowX: "auto",
-            background: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
-          }}
-        >
-          <code style={{ fontFamily: "var(--font-mono)" }}>{code}</code>
+        <pre style={{ ...CODE_BLOCK_SURFACE_STYLE, ...CODE_BLOCK_WRAP_STYLE }}>
+          <code style={CODE_BLOCK_CODE_TAG_STYLE}>{code}</code>
         </pre>
       ) : (
         <SyntaxHighlighter
           language={lang || "text"}
           style={isDark ? vscDarkPlus : vs}
           showLineNumbers
-          lineNumberStyle={{ color: "var(--text-dim)", fontStyle: "normal" }}
+          lineNumberStyle={CODE_BLOCK_LINE_NUMBER_STYLE}
           customStyle={{
-            margin: 0,
-            padding: "11px 13px",
-            fontSize: 12.5,
-            lineHeight: 1.62,
+            ...CODE_BLOCK_SURFACE_STYLE,
+            ...CODE_BLOCK_WRAP_STYLE,
             borderRadius: 0,
-            background: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
           }}
-          codeTagProps={{ style: { fontFamily: "var(--font-mono)" } }}
+          codeTagProps={{ style: CODE_BLOCK_CODE_TAG_STYLE }}
+          renderer={(rendererProps) => <CodeLineRenderer {...rendererProps} />}
+          wrapLongLines
         >
           {code}
         </SyntaxHighlighter>
