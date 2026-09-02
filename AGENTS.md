@@ -192,11 +192,15 @@ An explicit model pick in the browser is persisted as `modelRoles.default`
 
 ### Session archiving is web-only view state
 `lib/session-archive.ts` stores archived session ids in
-`~/.omp/agent/omp-web-archived-sessions.json`. Archiving must never move,
-rewrite, delete, or stop the session: `GET /api/sessions` only annotates matching
-rows with `archived: true`, and the sidebar partitions them into its reversible
-Archived section. Permanent deletion remains a separate action available from
-that section and removes the registry entry after deleting the JSONL file.
+`~/.omp/agent/omp-web-archived.json` as `{ archived: string[] }`. Archiving must
+never move, rewrite, delete, or stop the session — it is a listing change only.
+
+`GET /api/sessions` **filters** archived ids out of the response; the archived
+rows are a second request, `GET /api/sessions?archived=1`. The sidebar keeps an
+`archiveRefreshKey` counter and bumps it on every archive/restore so its
+collapsible Archived section refetches while the main list just reloads. Toggling
+is `PATCH /api/sessions/[id]` with `{ archived: boolean }`, which that route
+accepts alongside `{ name }`.
 
 ### `SessionManager.open()` is async
 Every omp `SessionManager.open()` / `forkFrom()` / `continueRecent()` returns a

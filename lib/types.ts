@@ -410,9 +410,6 @@ export interface SessionInfo {
   /** True while the runtime session exists only in memory and its JSONL file
    *  has not been created yet. Disk-backed actions must wait until this clears. */
   transient?: boolean;
-  /** True while this session is archived out of the active sidebar. Web-only
-   *  view state from the archive registry; the session file is untouched. */
-  archived?: boolean;
 }
 
 export interface SessionContext {

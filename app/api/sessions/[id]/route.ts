@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
-import { getAgentDir, SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent";
 import {
   resolveSessionPath,
   resolveSessionIdByPath,
@@ -17,9 +17,6 @@ import { getRpcSession } from "@/lib/rpc-manager";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import { projectTreeForResponse } from "@/lib/project-tree";
 import { computeSessionTotalActiveMs } from "@/lib/session-timing";
-
-/** PATCH body keys this route understands, i.e. the mutations it can apply. */
-const SUPPORTED_MUTATIONS = ["name", "archived"] as const;
 
 export async function GET(
   req: Request,
@@ -89,7 +86,7 @@ export async function GET(
   }
 }
 
-// PATCH /api/sessions/[id]  body: { name: string } | { archived: boolean }
+// PATCH /api/sessions/[id]  body: { name: string }
 export async function PATCH(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -103,46 +100,25 @@ export async function PATCH(
 
   const { id } = await params;
   try {
-    const body = await req.json() as unknown;
-    if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      return NextResponse.json({ error: "Body must be a JSON object" }, { status: 400 });
-    }
-    // Exactly one mutation per request: a body carrying both a rename and an
-    // archive change has no defined order, and applying half of it silently
-    // would be worse than refusing it.
-    const requested = SUPPORTED_MUTATIONS.filter((key) => key in body);
-    if (requested.length !== 1) {
-      return NextResponse.json(
-        { error: "Body must contain exactly one of: name, archived" },
-        { status: 400 },
-      );
-    }
-
-    const { name, archived } = body as { name?: unknown; archived?: unknown };
-    if (requested[0] === "archived") {
-      if (typeof archived !== "boolean") {
-        return NextResponse.json({ error: "archived must be a boolean" }, { status: 400 });
-      }
-      // Archiving is disk-backed view state, so a session whose JSONL file does
-      // not exist yet (transient runtime session) is not addressable here.
-      if (!(await resolveSessionPath(id))) {
-        return NextResponse.json({ error: "Session not found" }, { status: 404 });
-      }
-      // View state only: the session keeps running and its file is untouched,
-      // so there is no session-list cache to invalidate.
-      setSessionArchived(id, archived, getAgentDir());
-      return NextResponse.json({ ok: true, archived });
-    }
-
-    if (typeof name !== "string") {
-      return NextResponse.json({ error: "name is required" }, { status: 400 });
+    const { name, archived } = await req.json() as { name?: string; archived?: boolean };
+    const hasName = typeof name === "string";
+    const hasArchived = typeof archived === "boolean";
+    if (!hasName && !hasArchived) {
+      return NextResponse.json({ error: "name or archived is required" }, { status: 400 });
     }
     const filePath = await resolveSessionPath(id);
     if (!filePath) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
-    const sm = await SessionManager.open(filePath);
-    await sm.setSessionName(name.trim(), "user");
+    if (hasName) {
+      const sm = await SessionManager.open(filePath);
+      await sm.setSessionName(name.trim(), "user");
+    }
+    if (hasArchived) {
+      // Key the registry by the header id (what /api/sessions lists), not by
+      // whatever alias the client addressed the session with.
+      setSessionArchived(readSessionHeader(filePath)?.id ?? id, archived);
+    }
     invalidateSessionListCache();
     return NextResponse.json({ ok: true });
   } catch (error) {
@@ -199,9 +175,6 @@ export async function DELETE(
 
     await getRpcSession(id)?.shutdown();
     unlinkSync(filePath);
-    // Permanent deletion is the end of this id: drop any archive state so a
-    // future session reusing the id does not inherit it.
-    setSessionArchived(id, false, getAgentDir());
     invalidateSessionPathCache(id);
     invalidateSessionListCache();
     return NextResponse.json({ ok: true });
