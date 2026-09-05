@@ -35,6 +35,7 @@ import { PRESET_FULL } from "./tool-presets";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
 import type { SlashCommandInfo } from "./omp-types";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./omp-types";
+import { GoalModeController } from "./goal-mode";
 import type {
   ExtensionAskDialogResult,
   ExtensionUiRequest,
@@ -207,8 +208,13 @@ function appendSlashCommand(
   commands.push({ ...command, name });
 }
 
-/** Browser-native builtins with no shared SDK handler; advertised with their canonical registry metadata. */
-const BROWSER_NATIVE_SLASH_COMMANDS = ["fork"] as const;
+/**
+ * Browser-native builtins with no shared SDK handler; advertised with their
+ * canonical registry metadata. `/goal` is a mode command omp implements as a
+ * TUI-only handler, so it never reaches ACP discovery; omp-web drives the same
+ * GoalRuntime itself (lib/goal-mode.ts) and advertises it here.
+ */
+export const BROWSER_NATIVE_SLASH_COMMANDS = ["fork", "goal"] as const;
 
 /**
  * Keep the browser palette aligned with omp's own command registry and
@@ -283,6 +289,7 @@ export class AgentSessionWrapper {
   // The SDK registry removes terminal entries after emitting their lifecycle frame.
   // Keep a bounded per-session copy so state requests can still expose history.
   private readonly subagentHistory = new Map<string, SubagentSnapshot>();
+  private goalModeController: GoalModeController | null = null;
   private _alive = true;
 
   constructor(
@@ -413,6 +420,12 @@ export class AgentSessionWrapper {
 
   start(): void {
     this.syncPlanModeFromSession();
+    void this.goalMode.restore().catch((error) => {
+      console.error(
+        "[omp-web] failed to restore goal mode:",
+        error instanceof Error ? error.message : error,
+      );
+    });
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
       if (event.type === "agent_end") {
         invalidateSessionListCache();
@@ -420,6 +433,12 @@ export class AgentSessionWrapper {
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
       this.emit(event);
       if (RUNNING_STATE_EVENT_TYPES.has(event.type)) notifyRunningChange();
+      void this.goalMode.handleSessionEvent(event).catch((error) => {
+        console.error(
+          "[omp-web] goal mode failed to handle a session event:",
+          error instanceof Error ? error.message : error,
+        );
+      });
     });
     this.resetIdleTimer();
     notifyRunningChange();
@@ -506,7 +525,8 @@ export class AgentSessionWrapper {
       || type === "follow_up"
       || type === "handoff"
       || type === "get_commands"
-      || type === "execute_slash_command";
+      || type === "execute_slash_command"
+      || type === "goal";
   }
 
   private async withFinalRunningNotification<T>(operation: () => Promise<T>): Promise<T> {
@@ -536,6 +556,54 @@ export class AgentSessionWrapper {
       this.inner.agent.state.systemPrompt = [];
     }
   }
+  /**
+   * Goal mode lives server-side so an active goal keeps working through the
+   * continuation loop whether or not a browser tab is watching.
+   */
+  private get goalMode(): GoalModeController {
+    if (!this.goalModeController) {
+      this.goalModeController = new GoalModeController(this.inner, {
+        isBusy: () => this.promptRunning
+          || this.handoffRunning
+          || this.inner.isStreaming
+          || this.inner.isCompacting
+          || this.inner.isBashRunning,
+        runContinuation: (prompt) => this.runGoalContinuation(prompt),
+        onStatusChange: (status) => this.emit({ type: "goal_status", status }),
+      });
+    }
+    return this.goalModeController;
+  }
+
+  /**
+   * Send one goal continuation turn. It is a hidden custom message rather than
+   * a prompt so it does not appear as something the operator typed, but the
+   * browser must still see the session go busy, exactly as for a real prompt.
+   */
+  private async runGoalContinuation(prompt: string): Promise<void> {
+    this.promptRunning = true;
+    notifyRunningChange();
+    try {
+      await this.inner.promptCustomMessage({
+        customType: "goal-continuation",
+        content: prompt,
+        display: false,
+        attribution: "user",
+      });
+    } catch (error) {
+      this.emit({
+        type: "prompt_error",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    } finally {
+      this.promptRunning = false;
+      this.resetIdleTimer();
+      this.emit({ type: "prompt_done" });
+      notifyRunningChange();
+    }
+  }
+
   private syncPlanModeFromSession(): void {
     let state = this.inner.getPlanModeState?.();
     if (!state) {
@@ -711,6 +779,9 @@ export class AgentSessionWrapper {
         if (this.inner.isBashRunning) {
           throw new Error("Cannot send a prompt while a shell command is running");
         }
+        // A turn the operator asked for means the next continuation is wanted,
+        // and supersedes one already scheduled.
+        this.goalMode.onUserPrompt();
         // Fire and forget — events come via subscribe
         const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
@@ -740,6 +811,7 @@ export class AgentSessionWrapper {
       }
 
       case "abort":
+        this.goalMode.onAbort();
         await this.withFinalRunningNotification(() => this.inner.abort());
         return null;
 
@@ -771,6 +843,7 @@ export class AgentSessionWrapper {
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
           subagents: this.getSubagentSnapshots(),
+          goal: this.goalMode.getStatus(),
         };
       }
       case "get_subagents":
@@ -974,6 +1047,11 @@ export class AgentSessionWrapper {
       case "get_commands": {
         return { commands: await getAvailableSlashCommands(this.inner) };
       }
+
+      case "goal": {
+        return await this.goalMode.handleCommand((command.args as string | undefined) ?? "");
+      }
+
       case "execute_slash_command": {
         const output: string[] = [];
         const result: AcpBuiltinSlashCommandResult = await executeAcpBuiltinSlashCommand(command.message as string, {
@@ -1007,7 +1085,9 @@ export class AgentSessionWrapper {
       case "set_tools": {
         const toolNames = command.toolNames as string[];
         this.setForceEmptySystemPrompt(toolNames.length === 0);
-        await this.inner.setActiveToolsByName(withExtensionTools(this.inner, toolNames));
+        await this.inner.setActiveToolsByName(
+          this.goalMode.reconcileToolNames(withExtensionTools(this.inner, toolNames)),
+        );
         this.applyForcedEmptySystemPrompt();
         return null;
       }
@@ -1080,6 +1160,7 @@ export class AgentSessionWrapper {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.inner.isBashRunning) this.inner.abortBash();
     this.unsubscribe?.();
+    this.goalModeController?.dispose();
     this.subagents.dispose();
     this.subagentHistory.clear();
     for (const pending of this.pendingUiResponses.values()) pending.cancel();
