@@ -32,7 +32,13 @@ test("new-session startup adopts server state only while explicit overrides are 
     ensureSource,
     /thinkingLevelOverrideRef\.current === selectedThinkingLevel/,
   );
-  assert.match(ensureSource, /setThinkingLevel\(result\.thinkingLevel\)/);
+  // Explicit Auto must survive startup: the selector adopts the configured
+  // level, and the resolved effort is tracked separately for the `auto (x)` label.
+  assert.match(
+    ensureSource,
+    /setThinkingLevel\(result\.configuredThinkingLevel \?\? result\.thinkingLevel\)/,
+  );
+  assert.match(ensureSource, /setEffectiveThinkingLevel\(result\.thinkingLevel\)/);
 });
 
 test("model-list refresh does not overwrite a live session or explicit thinking override", () => {
